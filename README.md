@@ -891,3 +891,80 @@ The objective is to convert a doctor's raw knowledge into high-quality, localize
 The system should become increasingly autonomous as we learn from real production workflows, customer feedback and evaluation results.
 
 Our long-term vision is a regional-language medical content operations platform that can serve hundreds of medical professionals without requiring a proportional increase in manual production effort.
+---
+
+## 14. Day 1 pipeline: running it
+
+Upload a raw MP4 → transcribe (faster-whisper, CPU) → editing plan (Claude, or a rule-based fallback) → FFmpeg cut, captions and loudness → edited MP4.
+
+```bash
+cp .env.example .env      # optional: add ANTHROPIC_API_KEY to use the Claude planner
+make up                   # docker compose up --build -d: api on :8000 + worker
+make test                 # unit tests inside the api container
+make e2e                  # full flow on a synthetic 10 s clip
+make down
+```
+
+The first job downloads the Whisper model into the `data` volume, so it takes longer.
+
+### Services
+
+| Service | Role |
+|---|---|
+| `api` | FastAPI. Creates jobs, validates uploads, serves artifacts. Never processes video. |
+| `worker` | Claims queued jobs and runs the LangGraph pipeline `transcribe → plan → validate_plan → render`. |
+
+Both share the `data` volume: `jobs.db` (SQLite job table and queue), `storage/{job_id}/…` (source, transcript, plan, output), `models/` (Whisper cache).
+
+### Environment
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | unset | Enables the Claude planner. Without it, the rule planner removes fillers and silences over 0.7 s. |
+| `MEDREEL_ANTHROPIC_MODEL` | `claude-opus-5-5` | Model for the Claude planner. |
+| `MEDREEL_DATA_DIR` | `/data` | Volume for the job DB, storage and model cache. |
+| `MEDREEL_MAX_UPLOAD_MB` | `500` | Upload size limit. |
+| `MEDREEL_WHISPER_MODEL` | `base` | faster-whisper model size (`tiny` … `large-v3`). |
+| `MEDREEL_WHISPER_COMPUTE_TYPE` | `int8` | CTranslate2 compute type on CPU. |
+| `MEDREEL_WORKER_POLL_SECONDS` | `1.0` | Queue poll interval. |
+| `MEDREEL_LOG_LEVEL` | `INFO` | JSON logs on stdout. Transcript text is never logged. |
+
+### Endpoints
+
+| Method | Path | Result |
+|---|---|---|
+| GET | `/health` | `{"status": "ok"}` |
+| POST | `/api/jobs` | `201 {"job_id", "status": "created"}` |
+| GET | `/api/jobs/{job_id}` | Status (`created`, `uploaded`, `queued`, `transcribing`, `planning`, `rendering`, `done`, `failed`), error, timestamps |
+| POST | `/api/jobs/{job_id}/upload` | Multipart field `file`: MP4 with H.264/HEVC video and an audio stream |
+| POST | `/api/jobs/{job_id}/start` | `202`, job queued |
+| GET | `/api/jobs/{job_id}/transcript` | Word-level timestamps |
+| GET | `/api/jobs/{job_id}/editing-plan` | Kept segments, removed spans with reasons, captions, flagged terms, loudness target |
+| GET | `/api/jobs/{job_id}/output` | The edited MP4 |
+
+Errors always look like `{"error": {"code", "message", "job_id"?}}`: 404 unknown job, 409 wrong state (for example, start before upload or output before done), 413 too large, 415 not a valid MP4, 422 bad request.
+
+```bash
+JOB=$(curl -s -X POST localhost:8000/api/jobs | python3 -c 'import sys,json; print(json.load(sys.stdin)["job_id"])')
+curl -F "file=@raw.mp4;type=video/mp4" localhost:8000/api/jobs/$JOB/upload
+curl -X POST localhost:8000/api/jobs/$JOB/start
+curl localhost:8000/api/jobs/$JOB                  # poll until "done"
+curl localhost:8000/api/jobs/$JOB/transcript
+curl localhost:8000/api/jobs/$JOB/editing-plan
+curl -o edited.mp4 localhost:8000/api/jobs/$JOB/output
+```
+
+### Medical safeguards in the plan
+
+- Planners can only choose which spoken words to keep. Captions are built from the transcript, and `validate_plan` rejects any caption whose text is not the transcript.
+- The Claude planner is told never to cut words that carry medical meaning, and to flag doubtful medical terms instead of correcting them. The rule planner flags low-confidence words.
+- Segments must start and end on word boundaries, stay inside the source and must not overlap.
+
+### Known Day 1 limits
+
+- Uploads pass through the API (fine for small test videos). `R2Storage` is a stub that documents the signed-upload flow.
+- SQLite queue with a single worker. Move to Postgres or Redis for more than one worker host.
+- Loudness: gain to -14 LUFS plus a peak limiter. Peaky speech can land about 1 LU under target.
+- Cuts land exactly on Whisper word boundaries, with 10 ms fades. Whisper timings can clip word tails slightly.
+- No auth, no reframing to vertical, no titles or diagrams, no human approval step yet.
+- The Claude planner is wired in but was not exercised in the Day 1 tests, which ran without an API key.
