@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    image: medreel:dev
+    env_file: [{ path: .env, required: false }]
+    ports: ["8000:8000"]
+    volumes: [data:/data]
+
+  worker:
+    build: .
+    image: medreel:dev
+    command: ["python", "-m", "workflows.worker"]
+    env_file: [{ path: .env, required: false }]
+    volumes: [data:/data]
+    healthcheck: { disable: true }
+    depends_on: [api]
+
+volumes:
+  data: {}
